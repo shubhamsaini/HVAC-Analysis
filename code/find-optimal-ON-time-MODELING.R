@@ -1,0 +1,172 @@
+###################################
+### This R Code finds optimal ON time
+### based on historical indoor temperature
+### data and outside weather
+### It models the data using linear regression
+### and support vector regression
+
+### It also calculates potential savings
+### in the historical data based on the generated models
+####################################
+
+library(e1071)
+
+source("metrics.R") #Some accuracy metrics
+
+
+### standard template to load the relevant data
+### change as per requirement
+source("prepare-data.R")
+
+### Infer Chiller ON/OFF based on power consumption
+### 0=Off, 1=On
+threshold <- 50000
+data$ch1power[data$ch1power<threshold] <- 0
+data$ch1power[data$ch1power>threshold] <- 1
+data$ch2power[data$ch2power<threshold] <- 0
+data$ch2power[data$ch2power>threshold] <- 1
+
+
+### Incase of multiple chillers,
+### do OR operation to find if EITHER chiller is ON
+chON <- bitwOr(data$ch1power,data$ch2power)
+data <- cbind(data,chON)
+data <- data[,-c(3,4)]
+
+### Time of the Day (TOD)
+### For Eg: 6:45 PM = 18.75
+### Useful for regression
+data$time <- as.POSIXct(data$time)
+hour <- format(data$time,"%H")
+min <- as.integer(format(data$time,"%M"))
+min <- (min/60)*100
+TOD <- paste(hour,min,sep = ".")
+TOD <- as.numeric(TOD)
+data <- cbind(data,TOD)
+
+
+
+### Filter out data where Chiller is OFF
+onData <- data[data$chON==1,]
+onData$time <- as.character(onData$time)
+onData$time <- as.POSIXct(onData$time,tz="UTC")
+
+### Keep data for working hours only
+onData <- onData[format(onData$time,"%H:%M:%S")<"19:00:00",]
+onData <- onData[format(onData$time,"%H:%M:%S")>"04:00:00",]
+
+### Split data into list of individual days
+dailyData <- split(onData,as.Date(onData$time))
+
+
+### For each day, find the time for which Chiller has been running
+
+for(ind in 1:length(dailyData)){
+  
+  temp <- dailyData[[ind]]
+  
+  onDur <- array()
+  startTime <- temp$time[1]
+  for(i in 1:nrow(temp)){
+    onDur[i] <- as.numeric(temp$time[i] - startTime)
+    if(onDur[i]<15){
+      onDur[i] <- onDur[i]*60
+    }
+  }
+  
+  dailyData[[ind]] <- cbind(dailyData[[ind]],onDur)
+  
+}
+
+
+### Merge the list elements back into a DF
+finalData <- dailyData[[1]]
+for(i in 2:length(dailyData)){
+  finalData <- rbind(finalData,dailyData[[i]])
+}
+
+backupFinal <- finalData ## will be used for finding savings
+backupFinal$tempC <- na.approx(backupFinal$tempC)
+###Keep only indoor temp, outdoor temp, TOD and OnDur
+finalData <- finalData[,c("indoorTemp","tempC","TOD","onDur")]
+
+### Divide the data into Train/Test Set
+### Training data - 75%
+### Test Data - 25%
+smp_size <- floor(0.75 * nrow(finalData))
+
+## set the seed to make your partition reproductible
+set.seed(123)
+train_ind <- sample(seq_len(nrow(finalData)), size = smp_size)
+
+train <- finalData[train_ind, ]
+test <- finalData[-train_ind, ]
+
+
+### Keep only indoor temp, outdoor temp, TOD and OnDur
+# train <- train[,-c(1,3,4,6)]
+# test <- test[,-c(1,3,4,6)]
+
+train <- na.omit(train)
+test <- na.omit(test)
+
+onDur <- test$onDur
+### Remove onDur from test data for prediction
+test <- test[,-c(4)]
+
+
+
+### Model using linear regression
+lin <- lm(onDur~indoorTemp+tempC+TOD,train)
+predicted <- predict(lin,test)
+paste("SMAPE:",SMAPEper(onDur,predicted))
+
+plot(onDur, main=paste("Linear Model"),sub=paste("SMAPE=",SMAPEper(onDur,predicted)),xlab = "Observation")
+points(predicted,col="red")
+
+
+### Model using Support Vector Regression
+svmodel <- svm(onDur~indoorTemp+tempC+TOD,train)
+predictedSVM <- predict(svmodel, test)
+paste("SMAPE:",SMAPEper(onDur,predictedSVM))
+
+
+
+
+#######################################
+### Find the optimal parameters for SVR
+### Attention !!!
+### Very time consuming
+#######################################
+
+# tuneResult <- tune(svm, onDur~fl2mtech+tempC+TOD, data=train,
+#                    ranges = list(epsilon = seq(0,1,0.25), cost = 2^(seq(2,8,2)))
+# )
+# 
+# tunedModel <- tuneResult$best.model
+# tunedModelY <- predict(tunedModel, test)
+# SMAPEper(onDur,tunedModelY)
+
+
+
+
+
+
+###################################
+### Find potential savings based on
+### some prediction model
+###################################
+
+backupFinal <- backupFinal[format(backupFinal$time,"%H:%M:%S")=="09:00:00",]
+dailyData <- split(backupFinal,as.Date(backupFinal$time))
+
+savings <- data.frame()
+for(ind in 1:length(dailyData)){
+  predictedSaving <- predict(svmodel,data.frame(indoorTemp=25,tempC=dailyData[[ind]]$tempC[1],TOD=9))
+  savings[ind,1] <- dailyData[[ind]]$time[1]
+  savings[ind,2] <- dailyData[[ind]]$tempC[1]
+  savings[ind,3] <- dailyData[[ind]]$onDur[1]
+  savings[ind,4] <- dailyData[[ind]]$onDur[1] - predictedSaving
+}
+paste("Potential savings: ",sum(savings$V4,na.rm=TRUE),"minutes")
+
